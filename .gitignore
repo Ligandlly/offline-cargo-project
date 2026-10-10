@@ -1,0 +1,8 @@
+# 构建产物 / 临时目录
+/work/
+/dist/
+/input/
+
+# Python
+__pycache__/
+*.pyc

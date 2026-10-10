@@ -1,0 +1,127 @@
+name: Cargo Vendor Offline Bundle
+
+# 触发方式：
+#   1. 新建 / 编辑 Issue，正文中包含 Cargo.toml（代码块或附件）——自动处理；
+#   2. 在 Issue 中评论包含 `/vendor` —— 重新生成。
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write # 创建/更新 Release（离线包下载地址）
+  issues: write # 在 Issue 中回复结果
+
+# 同一个 Issue 只保留最后一次运行，避免并发冲突
+concurrency:
+  group: cargo-vendor-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  vendor:
+    name: Generate offline vendor bundle
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'issue_comment'
+        && github.event.comment.user.type != 'Bot'
+        && !github.event.issue.pull_request
+        && contains(github.event.comment.body, '/vendor'))
+      || (github.event_name == 'issues'
+        && (contains(github.event.issue.body, 'Cargo')
+          || contains(github.event.issue.body, 'cargo')
+          || contains(github.event.issue.body, '[package]')
+          || contains(github.event.issue.body, '[workspace]')
+          || contains(github.event.issue.body, '[dependencies')
+          || contains(github.event.issue.body, 'user-attachments')
+          || contains(github.event.issue.body, '/vendor')))
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          python3 --version
+
+      - name: Extract Cargo.toml from issue
+        id: extract
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/extract_manifest.py
+
+      - name: Explain missing manifest
+        if: steps.extract.outputs.found != 'true' && steps.extract.outputs.cargo_related == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file input/error.md
+          echo "::error::未在 Issue 中找到可用的 Cargo.toml"
+          exit 1
+
+      - name: Build offline bundle
+        id: bundle
+        if: steps.extract.outputs.found == 'true'
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: bash scripts/build_bundle.sh
+
+      - name: Upload workflow artifact (backup)
+        if: steps.extract.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-offline-issue-${{ github.event.issue.number }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/cargo-vendor.log
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Publish release and comment
+        if: steps.extract.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: bash scripts/publish.sh
+
+      - name: Comment failure details
+        if: failure() && steps.extract.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          {
+            echo "## ❌ 生成 Cargo 离线依赖包失败"
+            echo
+            echo "请检查 \`Cargo.toml\` 语法是否正确、依赖是否都能解析（私有 crate、本地 path 依赖、缺失的 workspace 成员等会导致失败）。"
+            echo
+            if [ -s dist/cargo-vendor.log ]; then
+              echo "<details><summary>cargo vendor 日志（末尾 120 行）</summary>"
+              echo
+              echo '```text'
+              tail -n 120 dist/cargo-vendor.log
+              echo '```'
+              echo
+              echo "</details>"
+            fi
+            echo
+            echo "修复后在本 Issue 中评论 \`/vendor\` 即可重新生成。"
+          } > /tmp/error-comment.md
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file /tmp/error-comment.md || true
